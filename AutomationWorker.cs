@@ -12,7 +12,8 @@ public class AutomationWorker : BackgroundService
     private readonly WeatherService _weather;
     private readonly ShutterService _shutters;
 
-    private DateTime? _lastAutoClose;
+    private double _accumulatedRadiation = 0;
+    private readonly Dictionary<string, DateTime> _lastAutoClose = new();
 
     public AutomationWorker(
         ILogger<AutomationWorker> logger,
@@ -42,130 +43,131 @@ public class AutomationWorker : BackgroundService
 
     private async Task RunCycleAsync(CancellationToken ct)
     {
-        var tz = TimeZoneInfo.FindSystemTimeZoneById(_config.CurrentValue.TimeZoneId);
-        var localNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, tz);
+        var config = _config.CurrentValue;
+        var tz = TimeZoneInfo.FindSystemTimeZoneById(config.TimeZoneId);
+        var utcNow = DateTime.UtcNow;
+        var localNow = TimeZoneInfo.ConvertTimeFromUtc(utcNow, tz);
 
-        _logger.LogInformation("--- Cycle at {Time} in {Timezone} ---", localNow.ToString("HH:mm:ss"), _config.CurrentValue.TimeZoneId);
+        _logger.LogInformation("--- Cycle at {Time} ({Timezone}) ---", localNow.ToString("HH:mm:ss"), config.TimeZoneId);
 
-        // 1. Sun position (pure math, no API)
-        var sun = _sunPosition.Calculate(_config.CurrentValue.Latitude, _config.CurrentValue.Longitude, DateTime.UtcNow);
+        // 1. Sun position
+        var sun = _sunPosition.Calculate(config.Latitude, config.Longitude, utcNow);
         _logger.LogInformation("Sun: azimuth={Azimuth:F1}°, elevation={Elevation:F1}°",
             sun.AzimuthDegrees, sun.ElevationDegrees);
 
-
-
-        // 2. Weather (Open-Meteo)
-        var weatherReading = await _weather.GetCurrentAsync(_config.CurrentValue.Latitude, _config.CurrentValue.Longitude, _config.CurrentValue.TimeZoneId, ct);
-        if (weatherReading is null)
+        // 2. Weather
+        var weather = await _weather.GetCurrentAsync(config.Latitude, config.Longitude, config.TimeZoneId, ct);
+        if (weather is null)
         {
             _logger.LogWarning("Skipping cycle: weather data unavailable");
             return;
         }
-        _logger.LogInformation("Weather: {Temp:F1}°C, direct radiation={Rad:F0} W/m²",
-            weatherReading.TemperatureCelsius, weatherReading.DirectRadiationWm2);
 
-        // 3. Evaluate conditions
-        bool shouldClose = EvaluateConditions(sun, weatherReading);
-        _logger.LogInformation("Decision: shutters should be {State}", shouldClose ? "CLOSED (20%)" : "OPEN (100%)");
+        // 3. Update radiation accumulator
+        _accumulatedRadiation = _accumulatedRadiation * config.HeatModel.AccumulationDecay + weather.DirectRadiationWm2;
+        _accumulatedRadiation = Math.Min(_accumulatedRadiation, config.HeatModel.AccumulationMax);
 
-        if (shouldClose && _lastAutoClose.HasValue)
+        _logger.LogInformation("Weather: {Temp:F1}°C, radiation={Rad:F0} W/m², accumulated={Acc:F0}",
+            weather.TemperatureCelsius, weather.DirectRadiationWm2, _accumulatedRadiation);
+
+        // 4. Sun elevation gate
+        if (sun.ElevationDegrees < config.MinElevationDegrees)
         {
-            var cooldownRemaining = _lastAutoClose.Value.AddMinutes(_config.CurrentValue.CooldownMinutes) - DateTime.UtcNow;
+            _logger.LogInformation("Sun elevation {Elev:F1}° below minimum {Min}°, skipping",
+                sun.ElevationDegrees, config.MinElevationDegrees);
+            return;
+        }
+
+        // 5. Act on each shutter independently
+        foreach (var shutter in config.Shutters)
+        {
+            await ProcessShutterAsync(shutter, sun, weather, config, ct);
+        }
+    }
+
+    private async Task<bool> ProcessShutterAsync(
+        ShutterConfig shutter,
+        SunPositionService.SunPosition sun,
+        WeatherReading weather,
+        AutomationConfig config,
+        CancellationToken ct)
+    {
+        var model = config.HeatModel;
+
+        // Compute individual scores (0–1)
+        double tempScore = Math.Clamp(
+            (weather.TemperatureCelsius - model.TempMin) / (model.TempMax - model.TempMin), 0, 1);
+
+        double instantRadScore = Math.Clamp(
+            weather.DirectRadiationWm2 / model.RadiationMax, 0, 1);
+
+        double accRadScore = Math.Clamp(
+            _accumulatedRadiation / model.AccumulationMax, 0, 1);
+
+        // Soft azimuth score — cosine falloff from center, 0 outside window
+        double azimuthDelta = Math.Abs(sun.AzimuthDegrees - shutter.AzimuthCenter);
+        double halfWidth = shutter.AzimuthWidth / 2.0;
+        double azimuthScore = azimuthDelta <= halfWidth
+            ? Math.Max(0, Math.Cos(azimuthDelta / halfWidth * Math.PI / 2.0))
+            : 0.0;
+
+        // Weighted heat score
+        var w = shutter.Weights;
+        double heatScore = w.Temperature * tempScore
+                         + w.InstantRadiation * instantRadScore
+                         + w.AccumulatedRadiation * accRadScore
+                         + w.Azimuth * azimuthScore;
+
+        _logger.LogInformation(
+            "[{Name}] scores: temp={T:F2} rad={R:F2} acc={A:F2} azimuth={Az:F2} → heat={H:F2}",
+            shutter.Name, tempScore, instantRadScore, accRadScore, azimuthScore, heatScore);
+
+        // Below minimum score — do nothing
+        if (heatScore < model.MinScoreToAct)
+        {
+            _logger.LogInformation("[{Name}] Heat score {Score:F2} below minimum {Min:F2}, no action",
+                shutter.Name, heatScore, model.MinScoreToAct);
+            return false;
+        }
+
+        // Map score to target position (higher score = more closed = lower position %)
+        int targetPosition = (int)Math.Round(
+            model.PositionCeilingPercent - heatScore * (model.PositionCeilingPercent - model.PositionFloorPercent));
+        targetPosition = Math.Clamp(targetPosition, model.PositionFloorPercent, model.PositionCeilingPercent);
+
+        // Per-shutter cooldown check
+        if (_lastAutoClose.TryGetValue(shutter.Name, out var lastClose))
+        {
+            var cooldownRemaining = lastClose.AddMinutes(shutter.CooldownMinutes) - DateTime.UtcNow;
             if (cooldownRemaining > TimeSpan.Zero)
             {
-                _logger.LogInformation("In cooldown, {Min:F0} minutes remaining before state change allowed",
-                    cooldownRemaining.TotalMinutes);
-                return;
+                _logger.LogInformation("[{Name}] In cooldown, {Min:F0} minutes remaining",
+                    shutter.Name, cooldownRemaining.TotalMinutes);
+                return false;
             }
         }
 
-        // 4. Act on each shutter
-        foreach (var shutter in _config.CurrentValue.Shutters)
-        {
-            await ProcessShutterAsync(shutter, shouldClose, ct);
-        }
-
-        if (shouldClose)
-            _lastAutoClose = DateTime.UtcNow;
-    }
-
-    private bool EvaluateConditions(SunPositionService.SunPosition sun, WeatherReading weather)
-    {
-        var reasons = new List<string>();
-        var blockers = new List<string>();
-
-        // Temperature check (with hysteresis handled via appsettings thresholds)
-        if (weather.TemperatureCelsius >= _config.CurrentValue.Temperature.CloseThresholdCelsius)
-            reasons.Add($"temperature {weather.TemperatureCelsius:F1}°C >= {_config.CurrentValue.Temperature.CloseThresholdCelsius}°C");
-        else
-            blockers.Add($"temperature {weather.TemperatureCelsius:F1}°C < {_config.CurrentValue.Temperature.CloseThresholdCelsius}°C");
-
-        // Sun elevation check
-        if (sun.ElevationDegrees >= _config.CurrentValue.Sun.MinElevationDegrees)
-            reasons.Add($"elevation {sun.ElevationDegrees:F1}° >= {_config.CurrentValue.Sun.MinElevationDegrees}°");
-        else
-            blockers.Add($"elevation {sun.ElevationDegrees:F1}° < {_config.CurrentValue.Sun.MinElevationDegrees}° (sun too low)");
-
-        // Sun azimuth check (is sun facing the west wall?)
-        if (sun.AzimuthDegrees >= _config.CurrentValue.Sun.AzimuthMinDegrees && sun.AzimuthDegrees <= _config.CurrentValue.Sun.AzimuthMaxDegrees)
-            reasons.Add($"azimuth {sun.AzimuthDegrees:F1}° in [{_config.CurrentValue.Sun.AzimuthMinDegrees}°–{_config.CurrentValue.Sun.AzimuthMaxDegrees}°]");
-        else
-            blockers.Add($"azimuth {sun.AzimuthDegrees:F1}° outside window [{_config.CurrentValue.Sun.AzimuthMinDegrees}°–{_config.CurrentValue.Sun.AzimuthMaxDegrees}°] (sun not facing windows)");
-
-        // Direct radiation check (filters overcast days)
-        if (weather.DirectRadiationWm2 >= _config.CurrentValue.Weather.DirectRadiationThresholdWm2)
-            reasons.Add($"radiation {weather.DirectRadiationWm2:F0} W/m² >= {_config.CurrentValue.Weather.DirectRadiationThresholdWm2} W/m²");
-        else
-            blockers.Add($"radiation {weather.DirectRadiationWm2:F0} W/m² < {_config.CurrentValue.Weather.DirectRadiationThresholdWm2} W/m² (overcast or nighttime)");
-
-        bool shouldClose = blockers.Count == 0;
-
-        if (shouldClose)
-            _logger.LogInformation("All conditions met: [{Reasons}]", string.Join(", ", reasons));
-        else
-            _logger.LogInformation("Conditions not met — blockers: [{Blockers}]", string.Join(", ", blockers));
-
-        return shouldClose;
-    }
-
-    private async Task ProcessShutterAsync(ShutterConfig shutter, bool shouldClose, CancellationToken ct)
-    {
+        // Poll current position
         var currentPosition = await _shutters.GetPositionAsync(shutter, ct);
         if (currentPosition is null)
         {
             _logger.LogWarning("[{Name}] Skipping: could not read current position", shutter.Name);
-            return;
+            return false;
         }
 
-        int tolerance = _config.CurrentValue.Shutter.PositionTolerancePercent;
-
-        if (shouldClose)
+        // Only close further, never open via automation
+        if (targetPosition >= currentPosition.Value)
         {
-            bool alreadyAtTarget = currentPosition.Value <= _config.CurrentValue.Shutter.ClosedPositionPercent + tolerance;
-            if (alreadyAtTarget)
-            {
-                _logger.LogInformation("[{Name}] Already at or past closed position {Pos}%, no action needed",
-                    shutter.Name, currentPosition.Value);
-                return;
-            }
-
-            _logger.LogInformation("[{Name}] Closing from {Current}% to {Target}%",
-                shutter.Name, currentPosition.Value, _config.CurrentValue.Shutter.ClosedPositionPercent);
-            await _shutters.SetPositionAsync(shutter, _config.CurrentValue.Shutter.ClosedPositionPercent, ct);
+            _logger.LogInformation("[{Name}] Target {Target}% >= current {Current}%, no action needed (won't open)",
+                shutter.Name, targetPosition, currentPosition.Value);
+            return false;
         }
-        else
-        {
-            bool isAtAutoClosed = Math.Abs(currentPosition.Value - _config.CurrentValue.Shutter.ClosedPositionPercent) <= tolerance;
-            if (!isAtAutoClosed)
-            {
-                _logger.LogInformation("[{Name}] At manual position {Pos}%, not overriding on open",
-                    shutter.Name, currentPosition.Value);
-                return;
-            }
 
-            _logger.LogInformation("[{Name}] Opening from {Current}% to {Target}%",
-                shutter.Name, currentPosition.Value, _config.CurrentValue.Shutter.OpenPositionPercent);
-            await _shutters.SetPositionAsync(shutter, _config.CurrentValue.Shutter.OpenPositionPercent, ct);
-        }
+        _logger.LogInformation("[{Name}] Closing from {Current}% to {Target}% (heat score: {Score:F2})",
+            shutter.Name, currentPosition.Value, targetPosition, heatScore);
+
+        await _shutters.SetPositionAsync(shutter, targetPosition, ct);
+        _lastAutoClose[shutter.Name] = DateTime.UtcNow;
+        return true;
     }
 }
