@@ -100,13 +100,13 @@ The Shelly Pro Dual Cover/Shutter PM controls 2 shutters per device. Map your sh
 ## Building
 
 ```bash
-docker build -t shutterautomation:latest .
+docker build -t sunstoowarmclosemyshutter:latest .
 ```
 
 With a specific version tag:
 
 ```bash
-docker build -t shutterautomation:1.0.0 -t shutterautomation:latest .
+docker build -t sunstoowarmclosemyshutter:1.0.0 -t sunstoowarmclosemyshutter:latest .
 ```
 
 ---
@@ -120,7 +120,7 @@ docker compose up
 Logs are written to stdout and are accessible via:
 
 ```bash
-docker logs -f shutter-automation
+docker logs -f sunstoowarmclosemyshutter
 ```
 
 The `appsettings.json` is mounted as a read-only volume so you can update thresholds without rebuilding the image. Changes take effect on the next cycle automatically.
