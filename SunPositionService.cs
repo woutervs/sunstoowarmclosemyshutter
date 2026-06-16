@@ -90,12 +90,12 @@ public class SunPositionService
     {
         if (elevationDeg > 85.0) return 0;
         if (elevationDeg > 5.0)
-            return 58.1 / Math.Tan(ToRadians(elevationDeg))
+            return (58.1 / Math.Tan(ToRadians(elevationDeg))
                    - 0.07 / Math.Pow(Math.Tan(ToRadians(elevationDeg)), 3)
-                   + 0.000086 / Math.Pow(Math.Tan(ToRadians(elevationDeg)), 5);
+                   + 0.000086 / Math.Pow(Math.Tan(ToRadians(elevationDeg)), 5)) / 3600.0;
         if (elevationDeg > -0.575)
-            return 1735.0 + elevationDeg * (-518.2 + elevationDeg * (103.4 + elevationDeg * (-12.79 + elevationDeg * 0.711)));
-        return -20.772 / Math.Tan(ToRadians(elevationDeg));
+            return (1735.0 + elevationDeg * (-518.2 + elevationDeg * (103.4 + elevationDeg * (-12.79 + elevationDeg * 0.711)))) / 3600.0;
+        return (-20.772 / Math.Tan(ToRadians(elevationDeg))) / 3600.0;
     }
 
     private static double ToJulianDate(DateTime utcTime)
