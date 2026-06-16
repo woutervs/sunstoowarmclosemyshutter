@@ -1,7 +1,7 @@
 ﻿# Set variables
 $registry = "registry.lan.woutervs.dev"
 $apiImage = "sunstoowarmclosemyshutter"
-$version = "1.2.1"
+$version = "2.0.0"
 
 docker build -t $registry/greyishcorp/${apiImage}:$version -t $registry/greyishcorp/${apiImage}:latest .
 

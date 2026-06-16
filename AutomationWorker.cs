@@ -15,8 +15,7 @@ public class AutomationWorker : BackgroundService
     private readonly ShutterService _shutters;
 
     private AutomationConfig _previousConfig = null!;
-
-    private double _accumulatedRadiation = 0;
+    private readonly Dictionary<string, double> _accumulatedRadiation = new();
     private readonly Dictionary<string, DateTime> _lastAutoClose = new();
 
     public AutomationWorker(
@@ -124,23 +123,10 @@ public class AutomationWorker : BackgroundService
             return;
         }
 
-        // 3. Update radiation accumulator
-        bool sunInWest = sun.AzimuthDegrees >= config.HeatModel.AccumulationAzimuthMin
-              && sun.AzimuthDegrees <= config.HeatModel.AccumulationAzimuthMax;
-        if (sunInWest)
-        {
-            _accumulatedRadiation = _accumulatedRadiation * config.HeatModel.AccumulationDecay + weather.DirectRadiationWm2;
-            _accumulatedRadiation = Math.Min(_accumulatedRadiation, config.HeatModel.AccumulationMax);
-        }
-        else
-        {
-            _accumulatedRadiation *= config.HeatModel.AccumulationDecay;
-        }
+        _logger.LogInformation("Weather: {Temp:F1}°C, radiation={Rad:F0} W/m²",
+            weather.TemperatureCelsius, weather.DirectRadiationWm2);
 
-        _logger.LogInformation("Weather: {Temp:F1}°C, radiation={Rad:F0} W/m², accumulated={Acc:F0}",
-            weather.TemperatureCelsius, weather.DirectRadiationWm2, _accumulatedRadiation);
-
-        // 4. Sun elevation gate
+        // 3. Sun elevation gate
         if (sun.ElevationDegrees < config.MinElevationDegrees)
         {
             _logger.LogInformation("Sun elevation {Elev:F1}° below minimum {Min}°, skipping",
@@ -148,10 +134,10 @@ public class AutomationWorker : BackgroundService
             return;
         }
 
-        // 5. Act on each shutter independently
+        // 4. Act on each shutter independently
         foreach (var shutter in config.Shutters)
         {
-            await ProcessShutterAsync(shutter, sun, weather, config, ct);
+            await ProcessShutterAsync(shutter, sun, weather, ct);
         }
     }
 
@@ -159,10 +145,24 @@ public class AutomationWorker : BackgroundService
         ShutterConfig shutter,
         SunPositionService.SunPosition sun,
         WeatherReading weather,
-        AutomationConfig config,
         CancellationToken ct)
     {
-        var model = config.HeatModel;
+        var model = shutter.HeatModel;
+
+        // Update per-shutter radiation accumulator
+        _accumulatedRadiation.TryGetValue(shutter.Name, out var accumulated);
+        bool sunInWindow = sun.AzimuthDegrees >= model.AccumulationAzimuthMin
+                        && sun.AzimuthDegrees <= model.AccumulationAzimuthMax;
+        if (sunInWindow)
+        {
+            accumulated = accumulated * model.AccumulationDecay + weather.DirectRadiationWm2;
+            accumulated = Math.Min(accumulated, model.AccumulationMax);
+        }
+        else
+        {
+            accumulated *= model.AccumulationDecay;
+        }
+        _accumulatedRadiation[shutter.Name] = accumulated;
 
         // Compute individual scores (0–1)
         double tempScore = Math.Clamp(
@@ -172,11 +172,11 @@ public class AutomationWorker : BackgroundService
             weather.DirectRadiationWm2 / model.RadiationMax, 0, 1);
 
         double accRadScore = Math.Clamp(
-            _accumulatedRadiation / model.AccumulationMax, 0, 1);
+            accumulated / model.AccumulationMax, 0, 1);
 
         // Soft azimuth score — cosine falloff from center, 0 outside window
-        double azimuthDelta = Math.Abs(sun.AzimuthDegrees - shutter.AzimuthCenter);
-        double halfWidth = shutter.AzimuthWidth / 2.0;
+        double azimuthDelta = Math.Abs(sun.AzimuthDegrees - shutter.Azimuth.Center);
+        double halfWidth = shutter.Azimuth.Width / 2.0;
         double azimuthScore = azimuthDelta <= halfWidth
             ? Math.Max(0, Math.Cos(azimuthDelta / halfWidth * Math.PI / 2.0))
             : 0.0;
@@ -189,8 +189,8 @@ public class AutomationWorker : BackgroundService
                          + w.Azimuth * azimuthScore;
 
         _logger.LogInformation(
-            "[{Name}] scores: temp={T:F2} rad={R:F2} acc={A:F2} azimuth={Az:F2} → heat={H:F2}",
-            shutter.Name, tempScore, instantRadScore, accRadScore, azimuthScore, heatScore);
+            "[{Name}] scores: temp={T:F2} rad={R:F2} acc={A:F2} azimuth={Az:F2} → heat={H:F2} (accumulated={Acc:F0})",
+            shutter.Name, tempScore, instantRadScore, accRadScore, azimuthScore, heatScore, accumulated);
 
         // Below minimum score — do nothing
         if (heatScore < model.MinScoreToAct)
