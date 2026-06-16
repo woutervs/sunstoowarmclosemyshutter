@@ -1,6 +1,8 @@
 using Microsoft.Extensions.Options;
 using ShutterAutomation.Models;
 using ShutterAutomation.Services;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace ShutterAutomation;
 
@@ -11,6 +13,8 @@ public class AutomationWorker : BackgroundService
     private readonly SunPositionService _sunPosition;
     private readonly WeatherService _weather;
     private readonly ShutterService _shutters;
+
+    private AutomationConfig _previousConfig = null!;
 
     private double _accumulatedRadiation = 0;
     private readonly Dictionary<string, DateTime> _lastAutoClose = new();
@@ -27,6 +31,63 @@ public class AutomationWorker : BackgroundService
         _sunPosition = sunPosition;
         _weather = weather;
         _shutters = shutters;
+
+        _previousConfig = _config.CurrentValue;
+
+        _config.OnChange(newConfig =>
+        {
+            var oldJson = JsonSerializer.SerializeToNode(_previousConfig);
+            var newJson = JsonSerializer.SerializeToNode(newConfig);
+
+            var changes = CompareJson(oldJson!, newJson!, "");
+
+            if (changes.Count > 0)
+                _logger.LogInformation("Configuration changed:\n{Changes}", string.Join("\n", changes));
+            else
+                _logger.LogInformation("Configuration reloaded but no values changed");
+
+            _previousConfig = newConfig;
+        });
+    }
+
+    private static List<string> CompareJson(JsonNode oldNode, JsonNode newNode, string path)
+    {
+        var changes = new List<string>();
+
+        if (oldNode is JsonObject oldObj && newNode is JsonObject newObj)
+        {
+            foreach (var key in oldObj.Select(x => x.Key).Union(newObj.Select(x => x.Key)))
+            {
+                var childPath = string.IsNullOrEmpty(path) ? key : $"{path}.{key}";
+                var oldChild = oldObj[key];
+                var newChild = newObj[key];
+
+                if (oldChild is null || newChild is null)
+                {
+                    changes.Add($"{childPath}: {oldChild} → {newChild}");
+                    continue;
+                }
+
+                changes.AddRange(CompareJson(oldChild, newChild, childPath));
+            }
+        }
+        else if (oldNode is JsonArray oldArr && newNode is JsonArray newArr)
+        {
+            for (int i = 0; i < Math.Max(oldArr.Count, newArr.Count); i++)
+            {
+                var childPath = $"{path}[{i}]";
+                if (i >= oldArr.Count || i >= newArr.Count)
+                    changes.Add($"{childPath}: {oldArr.ElementAtOrDefault(i)} → {newArr.ElementAtOrDefault(i)}");
+                else
+                    changes.AddRange(CompareJson(oldArr[i]!, newArr[i]!, childPath));
+            }
+        }
+        else if (oldNode.ToJsonString() != newNode.ToJsonString())
+        {
+            changes.Add($"{path}: {oldNode} → {newNode}");
+        }
+
+        return changes;
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
@@ -64,8 +125,17 @@ public class AutomationWorker : BackgroundService
         }
 
         // 3. Update radiation accumulator
-        _accumulatedRadiation = _accumulatedRadiation * config.HeatModel.AccumulationDecay + weather.DirectRadiationWm2;
-        _accumulatedRadiation = Math.Min(_accumulatedRadiation, config.HeatModel.AccumulationMax);
+        bool sunInWest = sun.AzimuthDegrees >= config.HeatModel.AccumulationAzimuthMin
+              && sun.AzimuthDegrees <= config.HeatModel.AccumulationAzimuthMax;
+        if (sunInWest)
+        {
+            _accumulatedRadiation = _accumulatedRadiation * config.HeatModel.AccumulationDecay + weather.DirectRadiationWm2;
+            _accumulatedRadiation = Math.Min(_accumulatedRadiation, config.HeatModel.AccumulationMax);
+        }
+        else
+        {
+            _accumulatedRadiation *= config.HeatModel.AccumulationDecay;
+        }
 
         _logger.LogInformation("Weather: {Temp:F1}°C, radiation={Rad:F0} W/m², accumulated={Acc:F0}",
             weather.TemperatureCelsius, weather.DirectRadiationWm2, _accumulatedRadiation);
