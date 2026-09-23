@@ -16,6 +16,7 @@ public class AutomationWorker : BackgroundService
 
     private AutomationConfig _previousConfig = null!;
     private readonly Dictionary<string, double> _accumulatedRadiation = new();
+    private readonly Dictionary<string, DateTime> _lastAccumulationUpdate = new();
     private readonly Dictionary<string, DateTime> _lastAutoClose = new();
 
     public AutomationWorker(
@@ -126,7 +127,14 @@ public class AutomationWorker : BackgroundService
         _logger.LogInformation("Weather: {Temp:F1}°C, radiation={Rad:F0} W/m²",
             weather.TemperatureCelsius, weather.DirectRadiationWm2);
 
-        // 3. Sun elevation gate
+        // 3. Update radiation accumulators EVERY cycle (also at night),
+        //    so they decay properly and don't carry yesterday's heat into the morning.
+        foreach (var shutter in config.Shutters)
+        {
+            UpdateAccumulator(shutter, sun, weather.DirectRadiationWm2, utcNow, config.CheckIntervalMinutes);
+        }
+
+        // 4. Sun elevation gate
         if (sun.ElevationDegrees < config.MinElevationDegrees)
         {
             _logger.LogInformation("Sun elevation {Elev:F1}° below minimum {Min}°, skipping",
@@ -134,11 +142,40 @@ public class AutomationWorker : BackgroundService
             return;
         }
 
-        // 4. Act on each shutter independently
+        // 5. Act on each shutter independently
         foreach (var shutter in config.Shutters)
         {
             await ProcessShutterAsync(shutter, sun, weather, ct);
         }
+    }
+
+    /// <summary>
+    /// Decays the accumulator by real elapsed time and adds radiation when the sun is in the window.
+    /// </summary>
+    private void UpdateAccumulator(
+        ShutterConfig shutter,
+        SunPositionService.SunPosition sun,
+        double radiation,
+        DateTime utcNow,
+        int intervalMinutes)
+    {
+        var model = shutter.HeatModel;
+        _accumulatedRadiation.TryGetValue(shutter.Name, out var accumulated);
+
+        // Decay proportional to elapsed time (in units of check intervals)
+        double steps = 1.0;
+        if (_lastAccumulationUpdate.TryGetValue(shutter.Name, out var last))
+            steps = Math.Max(0, (utcNow - last).TotalMinutes / intervalMinutes);
+        accumulated *= Math.Pow(model.AccumulationDecay, steps);
+
+        bool sunInWindow = sun.ElevationDegrees > 0
+                        && sun.AzimuthDegrees >= model.AccumulationAzimuthMin
+                        && sun.AzimuthDegrees <= model.AccumulationAzimuthMax;
+        if (sunInWindow)
+            accumulated = Math.Min(accumulated + radiation, model.AccumulationMax);
+
+        _accumulatedRadiation[shutter.Name] = accumulated;
+        _lastAccumulationUpdate[shutter.Name] = utcNow;
     }
 
     private async Task<bool> ProcessShutterAsync(
@@ -149,20 +186,8 @@ public class AutomationWorker : BackgroundService
     {
         var model = shutter.HeatModel;
 
-        // Update per-shutter radiation accumulator
+        // Accumulator is updated in RunCycleAsync — just read it here
         _accumulatedRadiation.TryGetValue(shutter.Name, out var accumulated);
-        bool sunInWindow = sun.AzimuthDegrees >= model.AccumulationAzimuthMin
-                        && sun.AzimuthDegrees <= model.AccumulationAzimuthMax;
-        if (sunInWindow)
-        {
-            accumulated = accumulated * model.AccumulationDecay + weather.DirectRadiationWm2;
-            accumulated = Math.Min(accumulated, model.AccumulationMax);
-        }
-        else
-        {
-            accumulated *= model.AccumulationDecay;
-        }
-        _accumulatedRadiation[shutter.Name] = accumulated;
 
         // Compute individual scores (0–1)
         double tempScore = Math.Clamp(
@@ -191,6 +216,14 @@ public class AutomationWorker : BackgroundService
         _logger.LogInformation(
             "[{Name}] scores: temp={T:F2} rad={R:F2} acc={A:F2} azimuth={Az:F2} → heat={H:F2} (accumulated={Acc:F0})",
             shutter.Name, tempScore, instantRadScore, accRadScore, azimuthScore, heatScore, accumulated);
+
+        // Too cold outside — never close, whatever the score
+        if (weather.TemperatureCelsius < model.MinTemperatureToAct)
+        {
+            _logger.LogInformation("[{Name}] Outdoor {Temp:F1}°C below {Min:F1}°C, no action",
+                shutter.Name, weather.TemperatureCelsius, model.MinTemperatureToAct);
+            return false;
+        }
 
         // Below minimum score — do nothing
         if (heatScore < model.MinScoreToAct)

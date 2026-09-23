@@ -35,6 +35,7 @@ public class HeatModelConfig
     public double AccumulationAzimuthMin { get; set; } = 230.0;
     public double AccumulationAzimuthMax { get; set; } = 330.0;
     public double MinScoreToAct { get; set; } = 0.25;
+    public double MinTemperatureToAct { get; set; } = 19.0;
     public int PositionFloorPercent { get; set; } = 40;
     public int PositionCeilingPercent { get; set; } = 100;
 }
